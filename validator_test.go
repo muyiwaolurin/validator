@@ -181,7 +181,9 @@ type CustomMadeUpStruct struct {
 }
 
 func ValidateValuerType(field reflect.Value) interface{} {
+
 	if valuer, ok := field.Interface().(driver.Valuer); ok {
+
 		val, err := valuer.Value()
 		if err != nil {
 			// handle the error how you want
@@ -210,6 +212,166 @@ type TestPartial struct {
 			OtherTest string `validate:"required"`
 		} `validate:"required,dive"`
 	}
+}
+
+type TestStruct struct {
+	String string `validate:"required" json:"StringVal"`
+}
+
+func StructValidationTestStructSuccess(v *Validate, structLevel *StructLevel) {
+
+	st := structLevel.CurrentStruct.Interface().(TestStruct)
+
+	if st.String != "good value" {
+		structLevel.ReportError(reflect.ValueOf(st.String), "String", "StringVal", "badvalueteststruct")
+	}
+}
+
+func StructValidationTestStruct(v *Validate, structLevel *StructLevel) {
+
+	st := structLevel.CurrentStruct.Interface().(TestStruct)
+
+	if st.String != "bad value" {
+		structLevel.ReportError(reflect.ValueOf(st.String), "String", "StringVal", "badvalueteststruct")
+	}
+}
+
+func StructValidationBadTestStructFieldName(v *Validate, structLevel *StructLevel) {
+
+	st := structLevel.CurrentStruct.Interface().(TestStruct)
+
+	if st.String != "bad value" {
+		structLevel.ReportError(reflect.ValueOf(st.String), "", "StringVal", "badvalueteststruct")
+	}
+}
+
+func StructValidationBadTestStructTag(v *Validate, structLevel *StructLevel) {
+
+	st := structLevel.CurrentStruct.Interface().(TestStruct)
+
+	if st.String != "bad value" {
+		structLevel.ReportError(reflect.ValueOf(st.String), "String", "StringVal", "")
+	}
+}
+
+func StructValidationNoTestStructCustomName(v *Validate, structLevel *StructLevel) {
+
+	st := structLevel.CurrentStruct.Interface().(TestStruct)
+
+	if st.String != "bad value" {
+		structLevel.ReportError(reflect.ValueOf(st.String), "String", "", "badvalueteststruct")
+	}
+}
+
+func StructValidationTestStructInvalid(v *Validate, structLevel *StructLevel) {
+
+	st := structLevel.CurrentStruct.Interface().(TestStruct)
+
+	if st.String != "bad value" {
+		structLevel.ReportError(reflect.ValueOf(nil), "String", "StringVal", "badvalueteststruct")
+	}
+}
+
+func StructValidationTestStructReturnValidationErrors(v *Validate, structLevel *StructLevel) {
+
+	s := structLevel.CurrentStruct.Interface().(TestStructReturnValidationErrors)
+
+	errs := v.Struct(s.Inner1.Inner2)
+	if errs == nil {
+		return
+	}
+
+	structLevel.ReportValidationErrors("Inner1.", errs.(ValidationErrors))
+}
+
+type TestStructReturnValidationErrorsInner2 struct {
+	String string `validate:"required"`
+}
+
+type TestStructReturnValidationErrorsInner1 struct {
+	Inner2 *TestStructReturnValidationErrorsInner2
+}
+
+type TestStructReturnValidationErrors struct {
+	Inner1 *TestStructReturnValidationErrorsInner1
+}
+
+func TestStructLevelReturnValidationErrors(t *testing.T) {
+	config := &Config{
+		TagName: "validate",
+	}
+
+	v1 := New(config)
+	v1.RegisterStructValidation(StructValidationTestStructReturnValidationErrors, TestStructReturnValidationErrors{})
+
+	inner2 := &TestStructReturnValidationErrorsInner2{
+		String: "I'm HERE",
+	}
+
+	inner1 := &TestStructReturnValidationErrorsInner1{
+		Inner2: inner2,
+	}
+
+	val := &TestStructReturnValidationErrors{
+		Inner1: inner1,
+	}
+
+	errs := v1.Struct(val)
+	Equal(t, errs, nil)
+
+	inner2.String = ""
+
+	errs = v1.Struct(val)
+	NotEqual(t, errs, nil)
+	AssertError(t, errs, "TestStructReturnValidationErrors.Inner1.Inner2.String", "String", "required")
+}
+
+func TestStructLevelValidations(t *testing.T) {
+
+	config := &Config{
+		TagName: "validate",
+	}
+
+	v1 := New(config)
+	v1.RegisterStructValidation(StructValidationTestStruct, TestStruct{})
+
+	tst := &TestStruct{
+		String: "good value",
+	}
+
+	errs := v1.Struct(tst)
+	NotEqual(t, errs, nil)
+	AssertError(t, errs, "TestStruct.String", "String", "badvalueteststruct")
+
+	v2 := New(config)
+	v2.RegisterStructValidation(StructValidationBadTestStructFieldName, TestStruct{})
+
+	PanicMatches(t, func() { v2.Struct(tst) }, fieldNameRequired)
+
+	v3 := New(config)
+	v3.RegisterStructValidation(StructValidationBadTestStructTag, TestStruct{})
+
+	PanicMatches(t, func() { v3.Struct(tst) }, tagRequired)
+
+	v4 := New(config)
+	v4.RegisterStructValidation(StructValidationNoTestStructCustomName, TestStruct{})
+
+	errs = v4.Struct(tst)
+	NotEqual(t, errs, nil)
+	AssertError(t, errs, "TestStruct.String", "String", "badvalueteststruct")
+
+	v5 := New(config)
+	v5.RegisterStructValidation(StructValidationTestStructInvalid, TestStruct{})
+
+	errs = v5.Struct(tst)
+	NotEqual(t, errs, nil)
+	AssertError(t, errs, "TestStruct.String", "String", "badvalueteststruct")
+
+	v6 := New(config)
+	v6.RegisterStructValidation(StructValidationTestStructSuccess, TestStruct{})
+
+	errs = v6.Struct(tst)
+	Equal(t, errs, nil)
 }
 
 func TestAliasTags(t *testing.T) {
@@ -252,7 +414,7 @@ func TestAliasTags(t *testing.T) {
 	NotEqual(t, errs, nil)
 	AssertError(t, errs, "[0]", "[0]", "iscolor")
 
-	PanicMatches(t, func() { validate.RegisterAliasValidation("exists", "gt=5,lt=10") }, "Alias \"exists\" either contains restricted characters or is the same as a restricted tag needed for normal operation")
+	PanicMatches(t, func() { validate.RegisterAliasValidation("exists", "gt=5,lt=10") }, "Alias 'exists' either contains restricted characters or is the same as a restricted tag needed for normal operation")
 }
 
 func TestNilValidator(t *testing.T) {
@@ -1335,12 +1497,6 @@ func TestSQLValue2Validation(t *testing.T) {
 }
 
 func TestSQLValueValidation(t *testing.T) {
-
-	// customTypes := map[reflect.Type]CustomTypeFunc{}
-	// customTypes[reflect.TypeOf((*driver.Valuer)(nil))] = ValidateValuerType
-	// customTypes[reflect.TypeOf(valuer{})] = ValidateValuerType
-	// customTypes[reflect.TypeOf(MadeUpCustomType{})] = ValidateCustomType
-	// customTypes[reflect.TypeOf(1)] = OverrideIntTypeForSomeReason
 
 	validate := New(&Config{TagName: "validate"})
 	validate.RegisterCustomTypeFunc(ValidateValuerType, (*driver.Valuer)(nil), valuer{})
@@ -3333,6 +3489,36 @@ func TestBase64Validation(t *testing.T) {
 	AssertError(t, errs, "", "", "base64")
 }
 
+func TestNoStructLevelValidation(t *testing.T) {
+
+	type Inner struct {
+		Test string `validate:"len=5"`
+	}
+
+	type Outer struct {
+		InnerStruct *Inner `validate:"required,nostructlevel"`
+	}
+
+	outer := &Outer{
+		InnerStruct: nil,
+	}
+
+	errs := validate.Struct(outer)
+	NotEqual(t, errs, nil)
+	AssertError(t, errs, "Outer.InnerStruct", "InnerStruct", "required")
+
+	inner := &Inner{
+		Test: "1234",
+	}
+
+	outer = &Outer{
+		InnerStruct: inner,
+	}
+
+	errs = validate.Struct(outer)
+	Equal(t, errs, nil)
+}
+
 func TestStructOnlyValidation(t *testing.T) {
 
 	type Inner struct {
@@ -3349,6 +3535,7 @@ func TestStructOnlyValidation(t *testing.T) {
 
 	errs := validate.Struct(outer)
 	NotEqual(t, errs, nil)
+	AssertError(t, errs, "Outer.InnerStruct", "InnerStruct", "required")
 
 	inner := &Inner{
 		Test: "1234",
@@ -4040,7 +4227,7 @@ func TestAddFunctions(t *testing.T) {
 	errs = validate.RegisterValidation("new", fn)
 	Equal(t, errs, nil)
 
-	PanicMatches(t, func() { validate.RegisterValidation("dive", fn) }, "Tag \"dive\" either contains restricted characters or is the same as a restricted tag needed for normal operation")
+	PanicMatches(t, func() { validate.RegisterValidation("dive", fn) }, "Tag 'dive' either contains restricted characters or is the same as a restricted tag needed for normal operation")
 }
 
 func TestChangeTag(t *testing.T) {

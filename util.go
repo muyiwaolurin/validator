@@ -13,8 +13,8 @@ const (
 	leftBracket        = "["
 	rightBracket       = "]"
 	restrictedTagChars = ".[],|=+()`~!@#$%^&*\\\"/?<>{}"
-	restrictedAliasErr = "Alias \"%s\" either contains restricted characters or is the same as a restricted tag needed for normal operation"
-	restrictedTagErr   = "Tag \"%s\" either contains restricted characters or is the same as a restricted tag needed for normal operation"
+	restrictedAliasErr = "Alias '%s' either contains restricted characters or is the same as a restricted tag needed for normal operation"
+	restrictedTagErr   = "Tag '%s' either contains restricted characters or is the same as a restricted tag needed for normal operation"
 )
 
 var (
@@ -26,6 +26,7 @@ var (
 		skipValidationTag: emptyStructPtr,
 		utf8HexComma:      emptyStructPtr,
 		utf8Pipe:          emptyStructPtr,
+		noStructLevelTag:  emptyStructPtr,
 	}
 )
 
@@ -58,9 +59,15 @@ func (v *Validate) ExtractType(current reflect.Value) (reflect.Value, reflect.Ki
 	default:
 
 		if v.hasCustomFuncs {
+			// fmt.Println("Type", current.Type())
 			if fn, ok := v.customTypeFuncs[current.Type()]; ok {
+
+				// fmt.Println("OK")
+
 				return v.ExtractType(reflect.ValueOf(fn(current)))
 			}
+
+			// fmt.Println("NOT OK")
 		}
 
 		return current, current.Kind()
@@ -270,15 +277,22 @@ func (v *Validate) parseTagsRecursive(cTag *cachedTag, tag, fieldName, alias str
 			}
 		}
 
-		if t == diveTag {
+		switch t {
+
+		case diveTag:
 			cTag.diveTag = tag
 			tVals := &tagVals{tagVals: [][]string{{t}}}
 			cTag.tags = append(cTag.tags, tVals)
 			return true
-		}
 
-		if t == omitempty {
+		case omitempty:
 			cTag.isOmitEmpty = true
+
+		case structOnlyTag:
+			cTag.isStructOnly = true
+
+		case noStructLevelTag:
+			cTag.isNoStructLevel = true
 		}
 
 		// if a pipe character is needed within the param you must use the utf8Pipe representation "0x7C"

@@ -26,16 +26,19 @@ const (
 	orSeparator             = "|"
 	tagKeySeparator         = "="
 	structOnlyTag           = "structonly"
+	noStructLevelTag        = "nostructlevel"
 	omitempty               = "omitempty"
 	skipValidationTag       = "-"
 	diveTag                 = "dive"
 	existsTag               = "exists"
-	fieldErrMsg             = "Key: \"%s\" Error:Field validation for \"%s\" failed on the \"%s\" tag"
+	fieldErrMsg             = "Key: '%s' Error:Field validation for '%s' failed on the '%s' tag"
 	arrayIndexFieldName     = "%s" + leftBracket + "%d" + rightBracket
 	mapIndexFieldName       = "%s" + leftBracket + "%v" + rightBracket
 	invalidValidation       = "Invalid validation tag on field %s"
 	undefinedValidation     = "Undefined validation function on field %s"
 	validatorNotInitialized = "Validator instance not initialized"
+	fieldNameRequired       = "Field Name Required"
+	tagRequired             = "Tag Required"
 )
 
 var (
@@ -45,9 +48,11 @@ var (
 )
 
 type cachedTag struct {
-	isOmitEmpty bool
-	diveTag     string
-	tags        []*tagVals
+	isOmitEmpty     bool
+	isNoStructLevel bool
+	isStructOnly    bool
+	diveTag         string
+	tags            []*tagVals
 }
 
 type tagVals struct {
@@ -75,17 +80,82 @@ func (s *tagCacheMap) Set(key string, value *cachedTag) {
 	s.m[key] = value
 }
 
+// StructLevel contains all of the information and helper methods
+// for reporting errors during struct level validation
+type StructLevel struct {
+	TopStruct     reflect.Value
+	CurrentStruct reflect.Value
+	errPrefix     string
+	errs          ValidationErrors
+	v             *Validate
+}
+
+// ReportValidationErrors accepts the key relative to the top level struct and validatin errors.
+// Example: had a triple nested struct User, ContactInfo, Country and ran errs := validate.Struct(country)
+// from within a User struct level validation would call this method like so:
+// ReportValidationErrors("ContactInfo.", errs)
+func (sl *StructLevel) ReportValidationErrors(relativeKey string, errs ValidationErrors) {
+	for _, e := range errs {
+		sl.errs[sl.errPrefix+relativeKey+e.Field] = e
+	}
+}
+
+// ReportError reports an error just by passing the field and tag information
+// NOTE: tag can be an existing validation tag or just something you make up
+// and precess on the flip side it's up to you.
+func (sl *StructLevel) ReportError(field reflect.Value, fieldName string, customName string, tag string) {
+
+	field, kind := sl.v.ExtractType(field)
+
+	if len(fieldName) == 0 {
+		panic(fieldNameRequired)
+	}
+
+	if len(customName) == 0 {
+		customName = fieldName
+	}
+
+	if len(tag) == 0 {
+		panic(tagRequired)
+	}
+
+	switch kind {
+	case reflect.Invalid:
+		sl.errs[sl.errPrefix+fieldName] = &FieldError{
+			Name:      customName,
+			Field:     fieldName,
+			Tag:       tag,
+			ActualTag: tag,
+			Param:     blank,
+			Kind:      kind,
+		}
+	default:
+		sl.errs[sl.errPrefix+fieldName] = &FieldError{
+			Name:      customName,
+			Field:     fieldName,
+			Tag:       tag,
+			ActualTag: tag,
+			Param:     blank,
+			Value:     field.Interface(),
+			Kind:      kind,
+			Type:      field.Type(),
+		}
+	}
+}
+
 // Validate contains the validator settings passed in using the Config struct
 type Validate struct {
-	tagName            string
-	fieldNameTag       string
-	validationFuncs    map[string]Func
-	customTypeFuncs    map[reflect.Type]CustomTypeFunc
-	aliasValidators    map[string]string
-	hasCustomFuncs     bool
-	hasAliasValidators bool
-	tagsCache          *tagCacheMap
-	errsPool           *sync.Pool
+	tagName             string
+	fieldNameTag        string
+	validationFuncs     map[string]Func
+	structLevelFuncs    map[reflect.Type]StructLevelFunc
+	customTypeFuncs     map[reflect.Type]CustomTypeFunc
+	aliasValidators     map[string]string
+	hasCustomFuncs      bool
+	hasAliasValidators  bool
+	hasStructLevelFuncs bool
+	tagsCache           *tagCacheMap
+	errsPool            *sync.Pool
 }
 
 func (v *Validate) initCheck() {
@@ -113,6 +183,9 @@ type CustomTypeFunc func(field reflect.Value) interface{}
 // field         = field value for validation
 // param         = parameter used in validation i.e. gt=0 param would be 0
 type Func func(v *Validate, topStruct reflect.Value, currentStruct reflect.Value, field reflect.Value, fieldtype reflect.Type, fieldKind reflect.Kind, param string) bool
+
+// StructLevelFunc accepts all values needed for struct level validation
+type StructLevelFunc func(v *Validate, structLevel *StructLevel)
 
 // ValidationErrors is a type of map[string]*FieldError
 // it exists to allow for multiple errors to be passed from this library
@@ -178,17 +251,33 @@ func New(config *Config) *Validate {
 	return v
 }
 
+// RegisterStructValidation registers a StructLevelFunc against a number of types
+// NOTE: this method is not thread-safe it is intended that these all be registered prior to any validation
+func (v *Validate) RegisterStructValidation(fn StructLevelFunc, types ...interface{}) {
+	v.initCheck()
+
+	if v.structLevelFuncs == nil {
+		v.structLevelFuncs = map[reflect.Type]StructLevelFunc{}
+	}
+
+	for _, t := range types {
+		v.structLevelFuncs[reflect.TypeOf(t)] = fn
+	}
+
+	v.hasStructLevelFuncs = true
+}
+
 // RegisterValidation adds a validation Func to a Validate's map of validators denoted by the key
 // NOTE: if the key already exists, the previous validation function will be replaced.
 // NOTE: this method is not thread-safe it is intended that these all be registered prior to any validation
-func (v *Validate) RegisterValidation(key string, f Func) error {
+func (v *Validate) RegisterValidation(key string, fn Func) error {
 	v.initCheck()
 
 	if len(key) == 0 {
 		return errors.New("Function Key cannot be empty")
 	}
 
-	if f == nil {
+	if fn == nil {
 		return errors.New("Function cannot be empty")
 	}
 
@@ -198,7 +287,7 @@ func (v *Validate) RegisterValidation(key string, f Func) error {
 		panic(fmt.Sprintf(restrictedTagErr, key))
 	}
 
-	v.validationFuncs[key] = f
+	v.validationFuncs[key] = fn
 
 	return nil
 }
@@ -327,7 +416,7 @@ func (v *Validate) StructPartial(current interface{}, fields ...string) error {
 
 	errs := v.errsPool.Get().(ValidationErrors)
 
-	v.tranverseStruct(sv, sv, sv, blank, errs, true, len(m) != 0, false, m)
+	v.tranverseStruct(sv, sv, sv, blank, errs, true, len(m) != 0, false, m, false)
 
 	if len(errs) == 0 {
 		v.errsPool.Put(errs)
@@ -354,7 +443,7 @@ func (v *Validate) StructExcept(current interface{}, fields ...string) error {
 
 	errs := v.errsPool.Get().(ValidationErrors)
 
-	v.tranverseStruct(sv, sv, sv, blank, errs, true, len(m) != 0, true, m)
+	v.tranverseStruct(sv, sv, sv, blank, errs, true, len(m) != 0, true, m, false)
 
 	if len(errs) == 0 {
 		v.errsPool.Put(errs)
@@ -373,7 +462,7 @@ func (v *Validate) Struct(current interface{}) error {
 	errs := v.errsPool.Get().(ValidationErrors)
 	sv := reflect.ValueOf(current)
 
-	v.tranverseStruct(sv, sv, sv, blank, errs, true, false, false, nil)
+	v.tranverseStruct(sv, sv, sv, blank, errs, true, false, false, nil, false)
 
 	if len(errs) == 0 {
 		v.errsPool.Put(errs)
@@ -384,7 +473,7 @@ func (v *Validate) Struct(current interface{}) error {
 }
 
 // tranverseStruct traverses a structs fields and then passes them to be validated by traverseField
-func (v *Validate) tranverseStruct(topStruct reflect.Value, currentStruct reflect.Value, current reflect.Value, errPrefix string, errs ValidationErrors, useStructName bool, partial bool, exclude bool, includeExclude map[string]*struct{}) {
+func (v *Validate) tranverseStruct(topStruct reflect.Value, currentStruct reflect.Value, current reflect.Value, errPrefix string, errs ValidationErrors, useStructName bool, partial bool, exclude bool, includeExclude map[string]*struct{}, isStructOnly bool) {
 
 	if current.Kind() == reflect.Ptr && !current.IsNil() {
 		current = current.Elem()
@@ -401,39 +490,51 @@ func (v *Validate) tranverseStruct(topStruct reflect.Value, currentStruct reflec
 		errPrefix += typ.Name() + "."
 	}
 
-	numFields := current.NumField()
+	// structonly tag present don't tranverseFields
+	// but must still check and run below struct level validation
+	// if present
+	if !isStructOnly {
+		numFields := current.NumField()
 
-	var fld reflect.StructField
-	var customName string
+		var fld reflect.StructField
+		var customName string
 
-	for i := 0; i < numFields; i++ {
-		fld = typ.Field(i)
+		for i := 0; i < numFields; i++ {
+			fld = typ.Field(i)
 
-		if !unicode.IsUpper(rune(fld.Name[0])) {
-			continue
-		}
-
-		if partial {
-
-			_, ok = includeExclude[errPrefix+fld.Name]
-
-			if (ok && exclude) || (!ok && !exclude) {
+			if !unicode.IsUpper(rune(fld.Name[0])) {
 				continue
 			}
-		}
 
-		customName = fld.Name
-		if v.fieldNameTag != "" {
+			if partial {
 
-			name := strings.SplitN(fld.Tag.Get(v.fieldNameTag), ",", 2)[0]
+				_, ok = includeExclude[errPrefix+fld.Name]
 
-			// dash check is for json "-" means don't output in json
-			if name != "" && name != "-" {
-				customName = name
+				if (ok && exclude) || (!ok && !exclude) {
+					continue
+				}
 			}
-		}
 
-		v.traverseField(topStruct, currentStruct, current.Field(i), errPrefix, errs, true, fld.Tag.Get(v.tagName), fld.Name, customName, partial, exclude, includeExclude)
+			customName = fld.Name
+			if v.fieldNameTag != "" {
+
+				name := strings.SplitN(fld.Tag.Get(v.fieldNameTag), ",", 2)[0]
+
+				// dash check is for json "-" means don't output in json
+				if name != "" && name != "-" {
+					customName = name
+				}
+			}
+
+			v.traverseField(topStruct, currentStruct, current.Field(i), errPrefix, errs, true, fld.Tag.Get(v.tagName), fld.Name, customName, partial, exclude, includeExclude)
+		}
+	}
+
+	// check if any struct level validations, after all field validations already checked.
+	if v.hasStructLevelFuncs {
+		if fn, ok := v.structLevelFuncs[current.Type()]; ok {
+			fn(v, &StructLevel{v: v, TopStruct: topStruct, CurrentStruct: current, errPrefix: errPrefix, errs: errs})
+		}
 	}
 }
 
@@ -498,13 +599,11 @@ func (v *Validate) traverseField(topStruct reflect.Value, currentStruct reflect.
 
 		if typ != timeType {
 
-			// required passed validation above so stop here
-			// if only validating the structs existance.
-			if strings.Contains(tag, structOnlyTag) {
+			if cTag.isNoStructLevel {
 				return
 			}
 
-			v.tranverseStruct(topStruct, current, current, errPrefix+name+".", errs, false, partial, exclude, includeExclude)
+			v.tranverseStruct(topStruct, current, current, errPrefix+name+".", errs, false, partial, exclude, includeExclude, cTag.isStructOnly)
 			return
 		}
 	}
@@ -532,7 +631,7 @@ func (v *Validate) traverseField(topStruct reflect.Value, currentStruct reflect.
 
 		if valTag.tagVals[0][0] == omitempty {
 
-			if !hasValue(v, topStruct, currentStruct, current, typ, kind, blank) {
+			if !HasValue(v, topStruct, currentStruct, current, typ, kind, blank) {
 				return
 			}
 			continue
